@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
-	"time"
+	"sync"
 
 	"github.com/gliderlabs/ssh"
 	"github.com/teris-io/shortid"
@@ -12,29 +15,46 @@ import (
 
 const privateKeyPath = "keys/test_id_rsa"
 
-func main() {
+var clients sync.Map
+
+type HTTPHandler struct{}
+
+func (h *HTTPHandler) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ch, ok := clients.Load(id)
+
+	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("id not found"))
+		return
+	}
+
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, "error reading request body")
+		log.Printf("error: %v", err)
+		return
+	}
+	defer r.Body.Close()
+
+	ch.(chan string) <- string(b)
+}
+
+func startHTTPServer() error {
+	router := http.NewServeMux()
+	handler := &HTTPHandler{}
+
+	router.HandleFunc("/{id}/*", handler.handleWebhook)
+
+	return http.ListenAndServe(":5000", router)
+}
+
+func startSSHServer() error {
 	generateMockSSHKeys()
 
 	sshPort := ":2222"
-
-	respCh := make(chan string)
-
-	handler := &SSHHandler{
-		respCh: respCh,
-	}
-
-	go func() {
-		time.Sleep(time.Second * 3)
-		id, _ := shortid.Generate()
-		respCh <- "http://hookpipe.com/" + id
-
-		time.Sleep(time.Second * 10)
-
-		for {
-			respCh <- "received data from hook"
-			time.Sleep(time.Second * 3)
-		}
-	}()
+	handler := &SSHHandler{}
 
 	server := &ssh.Server{
 		Addr:    sshPort,
@@ -65,20 +85,26 @@ func main() {
 
 	server.AddHostKey(signer)
 
-	log.Fatal(server.ListenAndServe())
+	return server.ListenAndServe()
 }
 
-type SSHHandler struct {
-	respCh chan string
+func main() {
+	go startSSHServer()
+	startHTTPServer()
 }
+
+type SSHHandler struct{}
 
 func (h *SSHHandler) handleSSHSession(session ssh.Session) {
-	forwardUrl := session.RawCommand()
-	_ = forwardUrl
-	resp := <-h.respCh
-	session.Write([]byte(resp + "\n"))
+	id := shortid.MustGenerate()
+	webhookURL := "http://hookpipe.com/" + id
+	session.Write([]byte(webhookURL + "\n"))
 
-	for data := range h.respCh {
+	respChan := make(chan string)
+
+	clients.Store(id, respChan)
+
+	for data := range respChan {
 		session.Write([]byte(data + "\n"))
 	}
 }
